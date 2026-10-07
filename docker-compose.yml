@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: bilingual-edition-api:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite 数据文件持久化到命名卷；删除容器不丢稿件与定版
+      - bilingual-data:/data
+    environment:
+      DB_PATH: /data/bilingual.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  bilingual-data:
