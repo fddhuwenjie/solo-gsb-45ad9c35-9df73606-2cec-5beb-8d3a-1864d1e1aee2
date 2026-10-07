@@ -2,7 +2,8 @@
 
 把有序的原文段与一种人工译文维护为可回看的双语**定版**。支持原文改写、
 **整篇段落编排（重排 / 删除 / 插入新段）**、带版本依据的译文提交 / 确认、
-失效待复核、乐观修订号校验，以及原子发布不可变的整篇双语快照。
+失效待复核、乐观修订号校验、原子发布不可变的整篇双语快照，以及面向读者的
+**当前生效定版**读取与带乐观版号校验的旧版切回。
 
 ## 领域模型与规则
 
@@ -35,12 +36,31 @@
   - 与当前修订号不一致 → `409`（修订冲突）；
   - 存在未准备好的段（无匹配当前原文版本的已确认译文，含编排插入的
     新段）→ `422`，响应体列出阻塞段；两种失败都**不增加版号**。
-  - 全部满足时，在单个立即写事务中原子生成新定版，内容是发布瞬间的
-    整篇双语文本 JSON 快照。发布与原文改写、段落编排通过 SQLite 写锁
-    互斥，快照只能是调整前**或**调整后的完整一整篇，不可能混入不同
-    工作稿修订的数据。
+  - 全部满足时，在单个立即写事务中原子生成新定版并把生效版指向新版，
+    内容是发布瞬间的整篇双语文本 JSON 快照。发布与原文改写、段落编排、
+    生效版切换通过 SQLite 写锁互斥，快照只能是调整前**或**调整后的完整
+    一整篇，不可能混入不同工作稿修订的数据。
 - **定版不可变**：按版号读取的永远是发布时的快照，后续改写 / 复核 /
   重排都不会改变它。
+- **当前生效定版（读者视角）**：每篇稿件有且仅有一个生效版。
+  - 首次及后续发布成功时，**不可变快照落库与生效版更新在同一写事务内
+    原子完成**（响应中的 `effective_edition` 即新生效版号）；发布因
+    修订冲突（`409`）或译文未确认（`422`）失败时事务整体回滚，**原生效
+    版保持不变**。
+  - `GET /manuscripts/{id}/effective` 读取当前生效版；尚无任何定版时
+    返回 `404`，响应明确表示"该稿件尚无生效定版"。
+  - `POST /manuscripts/{id}/effective/switch` 可切回该稿件**任一已发布
+    的旧版**，请求体为 `target_edition`（目标版号）与 `expected_edition`
+    （预期的当前生效版号）。目标版不存在 → `404`；预期版号过期
+    （其间有新发布或别的切换移动了生效指针）→ `409`；两种拒绝都**不
+    改变生效版**。
+  - **切换不生成新定版**：不推进工作稿修订号、不改变任何译文状态，按
+    版号读取的旧快照保持不变；切换只移动"生效指针"。
+  - 切换与发布通过同一把 SQLite 写锁互斥，且切换的"校验预期版号 →
+    更新指针"在同一事务内：**切换绝不可能覆盖其间新发布的定版**——
+    发布先提交则切换因预期过期被 `409`，切换先提交则随后的发布照常把
+    生效版推到新版。读者通过生效接口只能看到一个已完整发布的快照。
+  - 改写、编排或复核工作稿只影响工作稿，不影响生效版。
 
 ## 单条命令启动（Docker Compose）
 
@@ -116,7 +136,8 @@ curl -sS -X POST http://localhost:8000/manuscripts/$MID/segments/1/confirmation 
 ```bash
 curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications \
   -H 'Content-Type: application/json' -d '{"expected_revision": 1}' | jq .
-# => 201，edition=1，包含整篇 segments 双语内容
+# => 201，edition=1、effective_edition=1（快照与生效指针同一事务落库），
+#    包含整篇 segments 双语内容
 ```
 
 ### 6. 改写原文：旧确认译文失效待复核，仅影响该段
@@ -144,6 +165,7 @@ curl -i -X POST http://localhost:8000/manuscripts/$MID/publications \
   -H 'Content-Type: application/json' -d '{"expected_revision": 2}'
 # 422 body: {"detail":{"reason":"segments_not_confirmed",
 #   "blocking_segments":[{"position":0,"source_version":2}]}}
+# 两种失败都整体回滚：不增加版号，当前生效版也保持为第 1 版不变
 
 # 依据过期版本提交/确认 -> 409
 curl -i -X POST http://localhost:8000/manuscripts/$MID/segments/0/confirmation \
@@ -260,6 +282,76 @@ curl -sS http://localhost:8000/manuscripts/$MID/publications | jq '.[].edition'
 # 列出全部定版：1, 2, 3
 ```
 
+### 9. 读者读取当前生效定版
+
+```bash
+# 读者入口：永远返回"当前生效"的那一版（响应里 effective_edition 标明版号）
+curl -sS http://localhost:8000/manuscripts/$MID/effective | jq .
+# 沿用上文状态：第 3 版发布成功，故 effective_edition = 3
+
+# 从未发布过定版的稿件 -> 404，明确表示不存在
+NEW=$(curl -sS -X POST http://localhost:8000/manuscripts \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "未定版稿", "segments": ["只有工作稿。"]}' | jq .manuscript_id)
+curl -i http://localhost:8000/manuscripts/$NEW/effective
+# HTTP/1.1 404 Not Found
+# {"detail":"该稿件尚无生效定版"}
+
+# 发布失败不改变生效版：第 6 步中 rev 过期(409) / 译文未确认(422) 的
+# 两次失败发布之后，生效版仍指向失败前那一版。
+```
+
+### 10. 切回任一已发布旧版（带预期生效版号）
+
+```bash
+# 当前生效版是 3；提交目标版号 + 预期的当前生效版号，切回第 1 版
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/effective/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 1, "expected_edition": 3}' | jq '{effective_edition, edition, revision}'
+# => {"effective_edition":1,"edition":1,"revision":1}
+
+# 读者随即读到旧版内容（第 1 版是最初的两段）
+curl -sS http://localhost:8000/manuscripts/$MID/effective \
+  | jq '.effective_edition, [.segments[].source_text]'
+# => 1
+#    ["第一段原文。", "第二段原文。"]
+
+# 目标版从未发布 -> 404，生效版不变
+curl -i -X POST http://localhost:8000/manuscripts/$MID/effective/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 99, "expected_edition": 1}'
+
+# 预期生效版号过期（当前已是 1，却声称 3）-> 409，生效版不变
+curl -i -X POST http://localhost:8000/manuscripts/$MID/effective/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 2, "expected_edition": 3}'
+# 409 body: {"detail":"生效版号已过期：当前生效版为 1，请求依据的是 3"}
+
+# 用正确的预期版号 1 才能切到第 2 版
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/effective/switch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 2, "expected_edition": 1}' \
+  | jq '.effective_edition'
+# => 2
+```
+
+切换只移动生效指针，**不产生新定版、不动工作稿修订号**，按版号读取的
+快照也保持原样：
+
+```bash
+# 定版列表仍是 1, 2, 3；工作稿修订号仍是切换前的值
+curl -sS http://localhost:8000/manuscripts/$MID/publications | jq '.[].edition'
+curl -sS http://localhost:8000/manuscripts/$MID | jq .revision
+
+# 旧版生效期间照常工作、发布第 4 版：新发布在同一事务内把生效版推到 4，
+# 不会被早先的切换意图覆盖
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 4}' \
+  | jq '.edition, .effective_edition'   # 需工作稿当前确为 rev4 且各段已确认
+# => 4
+#    4
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -271,13 +363,16 @@ curl -sS http://localhost:8000/manuscripts/$MID/publications | jq '.[].edition'
 | POST | `/manuscripts/{id}/reorder` | 一次提交原子重排整篇：重排/删除旧段、插入新段（带 `expected_revision`） |
 | PUT | `/manuscripts/{id}/segments/{p}/translation` | 提交/改写译文（带 `source_version`） |
 | POST | `/manuscripts/{id}/segments/{p}/confirmation` | 确认译文（带 `source_version`） |
-| POST | `/manuscripts/{id}/publications` | 原子发布定版（带 `expected_revision`） |
+| POST | `/manuscripts/{id}/publications` | 原子发布定版并更新生效版（带 `expected_revision`） |
 | GET | `/manuscripts/{id}/publications` | 定版列表 |
 | GET | `/manuscripts/{id}/publications/{edition}` | 按版号回看定版快照 |
+| GET | `/manuscripts/{id}/effective` | 读者读取当前生效定版（无定版时 404） |
+| POST | `/manuscripts/{id}/effective/switch` | 切回任一已发布旧版（带 `target_edition` 与 `expected_edition`） |
 | GET | `/health` | 健康检查 |
 
-主要状态码：`200/201` 成功；`404` 稿件/段/定版不存在；`409` 修订冲突或
-依据过期原文版本；`422` 请求体校验失败、编排清单无效，或发布时存在
+主要状态码：`200/201` 成功；`404` 稿件/段/定版不存在（含读取生效版时
+尚无定版、切换目标版未发布）；`409` 修订冲突、依据过期原文版本，或切换
+时预期生效版号过期；`422` 请求体校验失败、编排清单无效，或发布时存在
 阻塞段。
 
 ## 测试
@@ -288,7 +383,11 @@ PYTHONPATH=. python -m pytest tests -q
 ```
 
 测试覆盖状态流转、过期版本拒绝、改版仅影响单段、发布的冲突与阻塞段、
-失败不增版号、定版快照不可变、改写与发布并发下快照不跨修订拼装
-（含多轮并发压测），以及段落编排的重排 / 删除 / 插入、保留段状态随段
+失败不增版号且原生效版不变、定版快照不可变、改写与发布并发下快照不跨修订
+拼装（含多轮并发压测），以及段落编排的重排 / 删除 / 插入、保留段状态随段
 移动、新段阻塞发布、过期与清单无效的整次回滚、编排与发布交错下定版
-只定格调整前或调整后的完整一整篇。
+只定格调整前或调整后的完整一整篇。生效定版另覆盖：无定版时读取明确
+404、首次与后续发布原子更新生效版、工作稿改写 / 编排 / 复核不影响生效版、
+切换到任一已发布旧版、目标不存在 404 与预期版号过期 409 都不改生效版、
+切换不生成新定版也不动工作稿修订号，以及切换与发布多轮并发交错下
+生效版永不被旧切换覆盖、读者只能读到已完整发布的快照。

@@ -40,6 +40,18 @@ class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class SwitchEffectiveRequest(BaseModel):
+    """把当前生效定版切回任一已发布旧版。
+
+    target_edition   —— 目标版号（必须是该稿件已发布的定版）；
+    expected_edition —— 请求方看到的当前生效版号（乐观并发控制：
+                        其间若有新发布或别的切换改变了生效版，则过期拒绝）。
+    """
+
+    target_edition: int = Field(ge=1)
+    expected_edition: int = Field(ge=1)
+
+
 class ReorderItem(BaseModel):
     """编排清单项：二选一。
 
@@ -107,3 +119,9 @@ class PublicationView(BaseModel):
     title: str
     published_at: str
     segments: list[PublicationSegment]
+
+
+class EffectivePublicationView(PublicationView):
+    """读者视角的"当前生效定版"：快照内容 + 当前生效版号。"""
+
+    effective_edition: int

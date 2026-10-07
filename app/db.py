@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS publications (
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (manuscript_id, edition)
 );
+
+-- 每篇稿件的"当前生效定版"指针：读者只通过它读取一个已完整发布的快照。
+-- 该指针只在发布事务内（与快照同事务）写入或随切换接口移动；它引用的
+-- (manuscript_id, edition) 必然是 publications 中已存在的一行。
+CREATE TABLE IF NOT EXISTS effective_editions (
+    manuscript_id INTEGER PRIMARY KEY REFERENCES manuscripts(id),
+    edition       INTEGER NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (manuscript_id, edition)
+        REFERENCES publications(manuscript_id, edition)
+);
 """
 
 
@@ -97,6 +108,16 @@ def init_db(database: str | None = None) -> None:
     conn = connect(database)
     try:
         conn.executescript(SCHEMA)
+        # 旧库迁移：生效版功能上线前已发布过定版的稿件，把生效指针补到
+        # 其最新一版。尚无定版的稿件不插行（读取时明确表示"无生效版"）。
+        conn.execute(
+            "INSERT INTO effective_editions (manuscript_id, edition) "
+            "SELECT p.manuscript_id, MAX(p.edition) FROM publications p "
+            "WHERE NOT EXISTS ( "
+            "    SELECT 1 FROM effective_editions e "
+            "    WHERE e.manuscript_id = p.manuscript_id "
+            ") GROUP BY p.manuscript_id"
+        )
         conn.commit()
     finally:
         conn.close()

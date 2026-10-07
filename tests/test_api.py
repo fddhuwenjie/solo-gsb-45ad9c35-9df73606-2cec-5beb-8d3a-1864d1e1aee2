@@ -73,6 +73,35 @@ def _reorder(client, mid, expected_revision, items):
     )
 
 
+def _get_effective(client, mid):
+    return client.get(f"/manuscripts/{mid}/effective")
+
+
+def _switch(client, mid, target_edition, expected_edition):
+    return client.post(
+        f"/manuscripts/{mid}/effective/switch",
+        json={
+            "target_edition": target_edition,
+            "expected_edition": expected_edition,
+        },
+    )
+
+
+def _publish_next_edition(client, mid, version):
+    """改写第 0 段、重新提交确认并发布下一版；返回 (edition, revision, version)。"""
+    revision = client.get(f"/manuscripts/{mid}").json()["revision"]
+    client.put(
+        f"/manuscripts/{mid}/segments/0/source",
+        json={"text": f"原文0-v{version + 1}", "expected_revision": revision},
+    )
+    _submit(client, mid, 0, f"t0-v{version + 1}", version + 1)
+    _confirm(client, mid, 0, version + 1)
+    r = _publish(client, mid, revision + 1)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    return body["edition"], revision + 1, version + 1
+
+
 def _ref(pos):
     return {"source_position": pos}
 
@@ -653,3 +682,274 @@ def test_validation_errors(client):
     r = client.post("/manuscripts", json={"title": "x", "segments": ["   "]})
     assert r.status_code == 422
     assert client.get("/manuscripts/999").status_code == 404
+
+
+# ---- 生效定版 -------------------------------------------------------------
+
+
+def test_effective_absent_before_any_publication(client):
+    mid = _create(client, 2)
+    # 尚无任何定版：读取生效版必须明确表示不存在
+    r = _get_effective(client, mid)
+    assert r.status_code == 404
+    assert "生效定版" in r.json()["detail"]
+    # 稿件本身不存在同样 404
+    assert _get_effective(client, 999).status_code == 404
+
+
+def test_first_publish_sets_effective_and_response_marks_it(client):
+    mid = _create(client, 2)
+    for i in range(2):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+
+    r = _publish(client, mid, 1)
+    assert r.status_code == 201
+    assert r.json()["effective_edition"] == 1
+
+    eff = _get_effective(client, mid).json()
+    assert eff["effective_edition"] == 1
+    assert eff["edition"] == 1
+    assert [s["target_text"] for s in eff["segments"]] == ["t0", "t1"]
+
+
+def test_failed_publish_keeps_previous_effective_unchanged(client):
+    mid = _create(client, 2)
+    for i in range(2):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+    assert _publish(client, mid, 1).status_code == 201
+
+    # 改版后第 0 段待复核：发布先撞 409（旧修订号），再撞 422（阻塞段）
+    client.put(
+        f"/manuscripts/{mid}/segments/0/source",
+        json={"text": "原文0-v2", "expected_revision": 1},
+    )
+    assert _publish(client, mid, 1).status_code == 409
+    assert _publish(client, mid, 2).status_code == 422
+
+    # 原生效版不变，仍是第 1 版的完整快照
+    eff = _get_effective(client, mid).json()
+    assert eff["effective_edition"] == 1
+    assert eff["segments"][0]["source_text"] == "原文0"
+    # 失败没有生成任何新定版
+    assert [p["edition"] for p in client.get(
+        f"/manuscripts/{mid}/publications").json()] == [1]
+
+
+def test_subsequent_publishes_move_effective_to_latest(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    assert _publish(client, mid, 1).json()["effective_edition"] == 1
+
+    _publish_next_edition(client, mid, 1)  # edition 2, revision 2
+    eff = _get_effective(client, mid).json()
+    assert eff["effective_edition"] == 2
+    assert eff["edition"] == 2
+    assert eff["segments"][0]["source_text"] == "原文0-v2"
+
+
+def test_draft_work_does_not_change_effective(client):
+    mid = _create(client, 2)
+    for i in range(2):
+        _submit(client, mid, i, f"t{i}", 1)
+        _confirm(client, mid, i, 1)
+    _publish(client, mid, 1)
+
+    # 改写、编排、提交 / 复核译文：工作稿变了，生效版仍是旧快照
+    client.put(
+        f"/manuscripts/{mid}/segments/1/source",
+        json={"text": "原文1-改", "expected_revision": 1},
+    )
+    _submit(client, mid, 1, "t1-new", 2)
+    _reorder(client, mid, 2, [_ref(1), _ref(0)])
+
+    eff = _get_effective(client, mid).json()
+    assert eff["effective_edition"] == 1
+    assert eff["revision"] == 1
+    assert [s["source_text"] for s in eff["segments"]] == ["原文0", "原文1"]
+    assert [s["target_text"] for s in eff["segments"]] == ["t0", "t1"]
+
+
+def test_switch_back_to_any_published_edition(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+    _publish_next_edition(client, mid, 1)
+    _publish_next_edition(client, mid, 2)
+    assert _get_effective(client, mid).json()["effective_edition"] == 3
+
+    # 切回旧版：内容就是该版号的不可变快照
+    r = _switch(client, mid, target_edition=1, expected_edition=3)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["effective_edition"] == 1
+    assert body["edition"] == 1
+    assert body["segments"][0]["source_text"] == "原文0"
+
+    eff = _get_effective(client, mid).json()
+    assert eff["edition"] == 1
+    assert eff["segments"][0]["target_text"] == "t0-v1"
+    # GET 生效版与按版号读取的快照完全一致
+    by_edition = client.get(f"/manuscripts/{mid}/publications/1").json()
+    assert by_edition["segments"] == eff["segments"]
+
+    # 再切到第 2 版
+    r = _switch(client, mid, target_edition=2, expected_edition=1)
+    assert r.status_code == 200
+    assert r.json()["effective_edition"] == 2
+    assert r.json()["segments"][0]["source_text"] == "原文0-v2"
+
+
+def test_switch_to_current_edition_is_idempotent(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+
+    r = _switch(client, mid, target_edition=1, expected_edition=1)
+    assert r.status_code == 200
+    assert r.json()["effective_edition"] == 1
+    assert _get_effective(client, mid).json()["effective_edition"] == 1
+
+
+def test_switch_rejects_missing_target_and_stale_expected(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+    _publish_next_edition(client, mid, 1)  # 当前生效版为 2
+
+    # 目标版不存在（未发布过）-> 404，生效版不变
+    r = _switch(client, mid, target_edition=9, expected_edition=2)
+    assert r.status_code == 404
+    assert _get_effective(client, mid).json()["effective_edition"] == 2
+
+    # 预期生效版号过期 -> 409，生效版不变
+    r = _switch(client, mid, target_edition=1, expected_edition=1)
+    assert r.status_code == 409
+    assert _get_effective(client, mid).json()["effective_edition"] == 2
+
+    # 两个条件同时不满足时仍不改动；目标存在但预期过期优先报 409/404 之一且拒绝
+    r = _switch(client, mid, target_edition=9, expected_edition=1)
+    assert r.status_code in (404, 409)
+    assert _get_effective(client, mid).json()["effective_edition"] == 2
+
+
+def test_switch_without_any_publication_rejected(client):
+    mid = _create(client, 1)
+    r = _switch(client, mid, target_edition=1, expected_edition=1)
+    assert r.status_code == 404
+    assert _get_effective(client, mid).status_code == 404
+
+    # 稿件不存在
+    assert _switch(client, 999, 1, 1).status_code == 404
+
+
+def test_switch_does_not_change_draft_or_create_snapshot(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+    _publish_next_edition(client, mid, 1)
+    revision_before = client.get(f"/manuscripts/{mid}").json()["revision"]
+    pubs_before = client.get(f"/manuscripts/{mid}/publications").json()
+
+    _switch(client, mid, target_edition=1, expected_edition=2)
+
+    # 工作稿修订号不变
+    assert client.get(f"/manuscripts/{mid}").json()["revision"] == revision_before
+    # 没有生成新定版（版号集合不变，快照内容不变）
+    pubs_after = client.get(f"/manuscripts/{mid}/publications").json()
+    assert [p["edition"] for p in pubs_after] == [p["edition"] for p in pubs_before]
+    assert pubs_after == pubs_before
+
+
+def test_new_publish_after_switch_moves_effective_forward(client):
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+    _publish_next_edition(client, mid, 1)
+    _switch(client, mid, target_edition=1, expected_edition=2)
+    assert _get_effective(client, mid).json()["effective_edition"] == 1
+
+    # 在旧生效版期间继续工作并发布第 3 版：生效版跟随新发布前进
+    _publish_next_edition(client, mid, 2)
+    eff = _get_effective(client, mid).json()
+    assert eff["effective_edition"] == 3
+    assert eff["edition"] == 3
+    assert eff["segments"][0]["source_text"] == "原文0-v3"
+    # 旧版号快照仍可原样回看
+    assert client.get(
+        f"/manuscripts/{mid}/publications/1").json()["segments"][0]["source_text"] == "原文0"
+
+
+def test_concurrent_switch_and_publish_never_rolls_back_effective(client):
+    """切换与发布交错：切换不得覆盖其间新发布的定版。
+
+    每轮两个线程同时进行：一个把生效版切回 1（带预期 = 当前生效版），
+    一个发布下一版 N。可串行化后只有两种结局：
+      A. 切换先提交 -> 生效版短暂为 1，随后发布提交并把生效版推到 N；
+      B. 发布先提交 -> 切换的预期版号过期，409，生效版保持 N。
+    轮末读生效版：必为当轮最新发布的 N，绝不能被旧切换覆盖回 1。
+    任何中途读到的生效版也必须是一个已存在的完整定版。
+    """
+    mid = _create(client, 1)
+    _submit(client, mid, 0, "t0-v1", 1)
+    _confirm(client, mid, 0, 1)
+    _publish(client, mid, 1)
+    _publish_next_edition(client, mid, 1)  # edition 2 / rev2 / v2，当前生效版 2
+
+    barrier = threading.Barrier(2)
+    observed_effective: list[int] = []
+    obs_lock = threading.Lock()
+
+    def switch_round(expected):
+        barrier.wait()
+        r = _switch(client, mid, target_edition=1, expected_edition=expected)
+        # 读者在切换返回后能看到的生效版必须是已发布定版之一
+        seen = _get_effective(client, mid).json()["effective_edition"]
+        with obs_lock:
+            observed_effective.append(seen)
+        return r.status_code
+
+    def publish_round(expected_revision):
+        barrier.wait()
+        return _publish(client, mid, expected_revision).status_code
+
+    for round_no in range(3, 9):
+        # 开跑前先在工作稿完成"改写 -> 重新提交确认"，把修订号推进到
+        # round_no 并使整篇齐备；真正竞速的只有切换与发布两件事。
+        r = client.put(
+            f"/manuscripts/{mid}/segments/0/source",
+            json={"text": f"原文0-v{round_no}", "expected_revision": round_no - 1},
+        )
+        assert r.status_code == 200, r.text
+        _submit(client, mid, 0, f"t0-v{round_no}", round_no)
+        _confirm(client, mid, 0, round_no)
+
+        expected = round_no - 1  # 轮初生效版 = 上一轮发布的版号
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            sw_future = ex.submit(switch_round, expected)
+            pb_future = ex.submit(publish_round, round_no)
+            sw_code, pb_code = sw_future.result(), pb_future.result()
+
+        assert pb_code == 201, (sw_code, pb_code)
+        assert sw_code in (200, 409)
+        # 轮末：新发布绝不被旧切换覆盖
+        assert _get_effective(client, mid).json()["effective_edition"] == round_no
+        # 观测到的生效版始终是已发布过的版号
+        assert all(1 <= e <= round_no for e in observed_effective)
+
+    # 总版号数与每轮一次发布吻合，且每个版号快照完好可读
+    editions = [p["edition"] for p in
+                client.get(f"/manuscripts/{mid}/publications").json()]
+    assert editions == list(range(1, 9))
+    expected_texts = {1: "原文0", **{e: f"原文0-v{e}" for e in range(2, 9)}}
+    for e in editions:
+        r = client.get(f"/manuscripts/{mid}/publications/{e}")
+        assert r.status_code == 200
+        assert r.json()["segments"][0]["source_text"] == expected_texts[e]

@@ -13,6 +13,20 @@
     已确认译文，否则要么 409 修订冲突，要么 422 返回阻塞段，且不增加版号。
   * 定版以整篇 JSON 快照落库，按版号读取永不随后续修改 / 复核 / 编排变化；
     编排与发布通过写锁互斥，定版只能定格调整前或调整后的完整一整篇。
+  * 每篇稿件有且仅有一个"当前生效定版"供读者读取：
+    首次及后续发布成功时，不可变快照落库与生效指针更新在同一写事务内
+    原子完成；发布因修订冲突（409）或译文未确认（422）失败时事务回滚，
+    原生效版保持不变。
+  * 生效版可携带"目标版号 + 预期当前生效版号"切回任一已发布旧版：
+    目标版不存在 -> 404；预期版号与当前生效版不一致 -> 409；两种拒绝都
+    不移动指针。切换不生成新定版、不触碰工作稿修订号，按版号读取的旧
+    快照保持不变。
+  * 切换与发布通过同一把写锁互斥，且切换的"校验预期版号 -> 更新指针"
+    在同一事务内：切换绝不可能覆盖其间新发布的定版（交错时新发布要么
+    尚未发生、切换后发布照常把指针推到新版；要么已经发生、切换因预期
+    过期被 409）。读者通过生效接口只能看到一个已完整发布的快照。
+  * 改写 / 编排 / 复核译文只影响工作稿，不影响生效版；尚无任何定版时
+    读取生效版返回 404 明确表示不存在。
 """
 
 from __future__ import annotations
@@ -33,6 +47,7 @@ from .schemas import (
     ConfirmTranslation,
     CreateManuscript,
     DraftView,
+    EffectivePublicationView,
     PublicationView,
     PublishRequest,
     ReorderSegments,
@@ -40,6 +55,7 @@ from .schemas import (
     SEGMENT_MISSING,
     SEGMENT_STALE,
     SubmitTranslation,
+    SwitchEffectiveRequest,
 )
 from .db import (
     STATUS_CONFIRMED,
@@ -540,19 +556,25 @@ def confirm_translation(
 # ---- 发布定版 -------------------------------------------------------------
 
 
-@app.post("/manuscripts/{manuscript_id}/publications", response_model=PublicationView, status_code=201)
+@app.post(
+    "/manuscripts/{manuscript_id}/publications",
+    response_model=EffectivePublicationView,
+    status_code=201,
+)
 def publish(
     manuscript_id: int,
     payload: PublishRequest,
     conn: sqlite3.Connection = Depends(db.get_conn),
 ) -> dict:
-    """原子发布定版。
+    """原子发布定版并更新生效版。
 
     1. expected_revision 与当前工作稿修订号不一致 -> 409，不增加版号。
     2. 任一段缺少匹配当前原文版本的已确认译文 -> 422，body 中列出阻塞段。
-    3. 全部满足 -> 在同一写事务内取下一版号并写入整篇快照。
-    事务由 BEGIN IMMEDIATE 起步，与原文改写互斥，快照不可能混入不同
-    工作稿修订的数据。
+    3. 全部满足 -> 在同一写事务内取下一版号、写入整篇快照，并把生效指针
+       指向新版（首次发布为插入，后续发布为更新）。快照与指针同时可见，
+       任何前置失败都会整体回滚：版号不增加，原生效版也保持不变。
+    事务由 BEGIN IMMEDIATE 起步，与原文改写、段落编排、生效版切换互斥，
+    快照不可能混入不同工作稿修订的数据。
     """
     with db.write_tx(conn):
         m = _get_manuscript(conn, manuscript_id)
@@ -589,7 +611,7 @@ def publish(
                 )
 
         if blocking:
-            # 422 必须在事务内抛出：write_tx 会回滚，版号不增加。
+            # 422 必须在事务内抛出：write_tx 会回滚，版号与生效指针都不变。
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"reason": "segments_not_confirmed", "blocking_segments": blocking},
@@ -612,6 +634,14 @@ def publish(
             "VALUES (?, ?, ?, ?, ?)",
             (manuscript_id, edition, m["revision"], m["title"], json.dumps(snapshot, ensure_ascii=False)),
         )
+        # 快照与生效指针同一事务落库：读者要么完全看不到本次发布（含失败
+        # 回滚），要么看到的生效版就是这一完整快照；不存在中间状态。
+        conn.execute(
+            "INSERT INTO effective_editions (manuscript_id, edition) VALUES (?, ?) "
+            "ON CONFLICT(manuscript_id) DO UPDATE SET "
+            "edition = excluded.edition, updated_at = datetime('now')",
+            (manuscript_id, edition),
+        )
         published_at = conn.execute(
             "SELECT created_at FROM publications WHERE manuscript_id = ? AND edition = ?",
             (manuscript_id, edition),
@@ -619,6 +649,7 @@ def publish(
 
     result = dict(snapshot)
     result["published_at"] = published_at
+    result["effective_edition"] = edition
     return result
 
 
@@ -652,6 +683,110 @@ def get_publication(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "定版不存在")
     return _publication_view(row)
+
+
+# ---- 生效定版（读者视角）---------------------------------------------------
+
+
+def _get_effective_row(conn: sqlite3.Connection, manuscript_id: int) -> sqlite3.Row:
+    """读取当前生效定版对应的快照行；稿件不存在 / 尚无生效版均明确 404。"""
+    _get_manuscript(conn, manuscript_id)
+    row = conn.execute(
+        "SELECT p.edition, p.revision, p.title, p.snapshot_json, p.created_at "
+        "FROM effective_editions e "
+        "JOIN publications p "
+        "  ON p.manuscript_id = e.manuscript_id AND p.edition = e.edition "
+        "WHERE e.manuscript_id = ?",
+        (manuscript_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "该稿件尚无生效定版")
+    return row
+
+
+@app.get(
+    "/manuscripts/{manuscript_id}/effective",
+    response_model=EffectivePublicationView,
+)
+def get_effective(
+    manuscript_id: int,
+    conn: sqlite3.Connection = Depends(db.get_conn),
+) -> dict:
+    """读取当前生效定版（读者入口）。
+
+    生效指针指向的快照行必在同一发布事务内一起提交，因此读者只能看到
+    一个已完整发布的快照；尚无任何定版时返回 404 明确表示不存在。
+    """
+    row = _get_effective_row(conn, manuscript_id)
+    view = _publication_view(row)
+    view["effective_edition"] = row["edition"]
+    return view
+
+
+@app.post(
+    "/manuscripts/{manuscript_id}/effective/switch",
+    response_model=EffectivePublicationView,
+)
+def switch_effective(
+    manuscript_id: int,
+    payload: SwitchEffectiveRequest,
+    conn: sqlite3.Connection = Depends(db.get_conn),
+) -> dict:
+    """把当前生效定版切回该稿件任一已发布的旧版（不生成新定版）。
+
+    乐观并发控制，全部校验与指针更新在同一个立即写事务内完成：
+      * 目标版号不是该稿件已发布的定版 -> 404，指针不变；
+      * expected_edition 与当前生效版号不一致（包括该稿件尚无生效版，
+        或其间有新发布 / 别的切换移动了指针）-> 409，指针不变。
+    切换只移动 effective_editions 指针：工作稿修订号、译文状态、按版号
+    读取的快照都不受影响。与发布互斥串行，故切换不会覆盖其间新发布的
+    定版。
+    """
+    with db.write_tx(conn):
+        _get_manuscript(conn, manuscript_id)
+
+        target = conn.execute(
+            "SELECT 1 FROM publications WHERE manuscript_id = ? AND edition = ?",
+            (manuscript_id, payload.target_edition),
+        ).fetchone()
+        if target is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"目标定版不存在：版号 {payload.target_edition} 从未发布",
+            )
+
+        current = conn.execute(
+            "SELECT edition FROM effective_editions WHERE manuscript_id = ?",
+            (manuscript_id,),
+        ).fetchone()
+        if current is None:
+            # 正常路径下不可能发生：有定版必有发布事务写下的生效指针。
+            raise _conflict("该稿件尚无生效定版，无法切换")
+        if current["edition"] != payload.expected_edition:
+            raise _conflict(
+                f"生效版号已过期：当前生效版为 {current['edition']}，"
+                f"请求依据的是 {payload.expected_edition}"
+            )
+
+        if payload.target_edition != current["edition"]:
+            conn.execute(
+                "UPDATE effective_editions SET edition = ?, updated_at = datetime('now') "
+                "WHERE manuscript_id = ?",
+                (payload.target_edition, manuscript_id),
+            )
+
+        row = conn.execute(
+            "SELECT p.edition, p.revision, p.title, p.snapshot_json, p.created_at "
+            "FROM effective_editions e "
+            "JOIN publications p "
+            "  ON p.manuscript_id = e.manuscript_id AND p.edition = e.edition "
+            "WHERE e.manuscript_id = ?",
+            (manuscript_id,),
+        ).fetchone()
+
+    view = _publication_view(row)
+    view["effective_edition"] = row["edition"]
+    return view
 
 
 def _publication_view(row: sqlite3.Row) -> dict:
