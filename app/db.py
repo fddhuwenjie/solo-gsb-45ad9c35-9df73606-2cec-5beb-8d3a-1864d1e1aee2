@@ -3,6 +3,10 @@
 所有写操作都在单条事务中完成，并通过 BEGIN IMMEDIATE 在事务一开始就
 获取 SQLite 的库级保留锁，从而把"读修订号 -> 校验 -> 写入"这一过程串行化，
 保证发布定版时不会与原文改写交错、混入不同工作稿修订的数据。
+
+manuscripts.active_edition 是读者可见的生效版指针：发布时在写定版快照的
+同一事务内更新，切换时在同一事务内做 CAS 校验后更新，因此读者要么看到
+指针未动的旧定版，要么看到一次操作完整提交后的新定版，没有中间状态。
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ CREATE TABLE IF NOT EXISTS manuscripts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     title         TEXT NOT NULL,
     revision      INTEGER NOT NULL DEFAULT 1,  -- 工作稿修订号，原文每次改版 +1
+    -- 当前对读者生效的定版版号；从未成功发布过为 NULL。
+    -- 只在发布 / 切换的写事务内与数据改动同事务更新。
+    active_edition INTEGER,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -97,6 +104,11 @@ def init_db(database: str | None = None) -> None:
     conn = connect(database)
     try:
         conn.executescript(SCHEMA)
+        # 兼容升级：旧库的 manuscripts 表没有 active_edition 列时补上。
+        # 既有稿件此前从未发布过，该列初始为 NULL（尚无生效版）。
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(manuscripts)")}
+        if "active_edition" not in columns:
+            conn.execute("ALTER TABLE manuscripts ADD COLUMN active_edition INTEGER")
         conn.commit()
     finally:
         conn.close()

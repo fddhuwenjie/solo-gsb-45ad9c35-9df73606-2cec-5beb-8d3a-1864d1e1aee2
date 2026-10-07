@@ -40,6 +40,18 @@ class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+class ActivateEdition(BaseModel):
+    """切换生效版：把当前生效版指回目标已发布定版。
+
+    target_edition 必须是本稿任一已发布过的版号；expected_active_edition
+    是调用方预期的"当前生效版号"（首次发布前尚无生效版时传 null），
+    两者在同一写事务内做 CAS 校验，任一项不满足都拒绝且不改动生效版。
+    """
+
+    target_edition: int = Field(ge=1)
+    expected_active_edition: int | None = Field(default=None, ge=1)
+
+
 class ReorderItem(BaseModel):
     """编排清单项：二选一。
 

@@ -2,7 +2,8 @@
 
 把有序的原文段与一种人工译文维护为可回看的双语**定版**。支持原文改写、
 **整篇段落编排（重排 / 删除 / 插入新段）**、带版本依据的译文提交 / 确认、
-失效待复核、乐观修订号校验，以及原子发布不可变的整篇双语快照。
+失效待复核、乐观修订号校验、原子发布不可变的整篇双语快照，以及每篇稿件
+一份、读者随时可取的**当前生效定版**（可凭乐观校验切回任一已发布旧版）。
 
 ## 领域模型与规则
 
@@ -41,6 +42,26 @@
     工作稿修订的数据。
 - **定版不可变**：按版号读取的永远是发布时的快照，后续改写 / 复核 /
   重排都不会改变它。
+- **每篇稿件有且仅有一个读者生效版（active edition）**：稿件元数据中的
+  `active_edition` 即当前生效版号，从未成功发布过为 `null`。
+  - 首次及后续每次发布成功时，**写不可变快照与更新生效版指针在同一个
+    写事务内完成**：要么两者都生效，要么都不生效；发布因修订冲突
+    （`409`）或译文未确认（`422`）失败时，原生效版保持不变。
+  - 读者经 `GET /manuscripts/{id}/publications/current` 读取生效版；
+    尚无定版时返回 `404`，响应明确表示"尚无生效定版"，而不是返回
+    工作稿内容。
+  - `POST /manuscripts/{id}/publications/current` 提交**目标版号**
+    `target_edition` 与**预期生效版号** `expected_active_edition`，即可
+    把生效版切回该稿件**任一已发布的旧版**（乐观 CAS）：
+    目标版号从未发布 → `404`；预期版号与当前生效版不符（已被别的发布
+    或切换推进）→ `409`；两种拒绝都**不改动生效版**。首次发布前尚无
+    生效版时，`expected_active_edition` 传 `null`。
+  - 切换与发布交错时由同一把 SQLite 写锁串行：切换只在预期仍匹配时移动
+    指针，故**绝不会覆盖其间新发布的定版**；读者任何时刻读到的生效版
+    都是一份已经完整发布的快照。
+  - 切换**只移动指针**：不生成新定版、不改变工作稿修订号、不影响改写 /
+    编排 / 复核；按版号读取的快照保持不变（指向旧版只是让读者重新看到
+    那份旧快照）。
 
 ## 单条命令启动（Docker Compose）
 
@@ -86,6 +107,14 @@ MID=1
 ```bash
 curl -sS http://localhost:8000/manuscripts/$MID/draft | jq .
 # 初始每段 status 为 "missing"，source_version 为 1
+
+# 稿件元数据：发布前 active_edition 为 null（尚无生效版）
+curl -sS http://localhost:8000/manuscripts/$MID | jq '{revision, active_edition}'
+# => {"revision":1,"active_edition":null}
+
+# 尚无定版时读取生效版：404，明确表示不存在
+curl -i http://localhost:8000/manuscripts/$MID/publications/current
+# 404 body: {"detail":"该稿件尚无生效定版（尚未成功发布过任何定版）"}
 ```
 
 ### 3. 提交译文（注明所依据的原文版本）
@@ -117,6 +146,10 @@ curl -sS -X POST http://localhost:8000/manuscripts/$MID/segments/1/confirmation 
 curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications \
   -H 'Content-Type: application/json' -d '{"expected_revision": 1}' | jq .
 # => 201，edition=1，包含整篇 segments 双语内容
+#    快照落库与生效版指针更新在同一事务完成，发布成功即可读生效版
+
+curl -sS http://localhost:8000/manuscripts/$MID/publications/current | jq '.edition'
+# => 1
 ```
 
 ### 6. 改写原文：旧确认译文失效待复核，仅影响该段
@@ -260,25 +293,107 @@ curl -sS http://localhost:8000/manuscripts/$MID/publications | jq '.[].edition'
 # 列出全部定版：1, 2, 3
 ```
 
+### 9. 读者读取生效版，并切回任一已发布旧版
+
+`GET .../publications/current` 返回读者当前应看到的生效定版；
+`POST .../publications/current` 用 `target_edition` + `expected_active_edition`
+做一次乐观切换（不生成新定版、不动工作稿）。沿用上文已发布 1、2、3 版、
+当前生效为第 3 版的状态：
+
+```bash
+# 读者始终读这一个地址即可拿到"当前生效定版"
+curl -sS http://localhost:8000/manuscripts/$MID/publications/current | jq '.edition'
+# => 3
+
+# 切回第 1 版：预期当前生效是第 3 版
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 1, "expected_active_edition": 3}' | jq '.edition'
+# => 200, 1（响应体即第 1 版快照）
+
+curl -sS http://localhost:8000/manuscripts/$MID/publications/current | jq '.edition'
+# => 1（读者生效版已切回第 1 版）
+
+# 工作稿修订号与定版列表都不因切换改变
+curl -sS http://localhost:8000/manuscripts/$MID | jq '{revision, active_edition}'
+# => {"revision":4,"active_edition":1}
+curl -sS http://localhost:8000/manuscripts/$MID/publications | jq '.[].edition'
+# => 1, 2, 3（没有新增版号）
+
+# 再切回第 3 版后，可在任意已发布版之间反复切换
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 3, "expected_active_edition": 1}' | jq '.edition'
+# => 3
+```
+
+目标不存在、或预期版号过期时一律拒绝，且**不改动当前生效版**：
+
+```bash
+# 目标版号从未发布 -> 404（此时生效为第 3 版）
+curl -i -X POST http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 99, "expected_active_edition": 3}'
+# 404 body: {"detail":"目标定版第 99 版不存在：只能切回本稿件已经发布过的版号"}
+
+# 预期版号过期（当前生效是 3，却按 1 提交）-> 409
+curl -i -X POST http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 2, "expected_active_edition": 1}'
+# 409 body: {"detail":"预期生效版号过期：当前生效版为第 3 版，请求预期的是第 1 版"}
+
+curl -sS http://localhost:8000/manuscripts/$MID/publications/current | jq '.edition'
+# => 3（两次拒绝后生效版仍是第 3 版）
+```
+
+切换与发布交错时，过期的切换不会覆盖其间新发布的定版：
+
+```bash
+# 假设工作稿推进到 rev5 并成功发布了第 4 版（生效版随发布事务推进到 4），
+# 那么此前按 expected_active_edition=3 发起的切换会因预期过期得到 409，
+# 第 4 版保持生效；只有重新以 4 为预期的切换才能再切回旧版。
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 5}' >/dev/null   # 发布第 4 版
+curl -sS http://localhost:8000/manuscripts/$MID | jq '.active_edition'          # => 4
+
+curl -sS -o /dev/null -w "%{http_code}\n" -X POST \
+  http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 1, "expected_active_edition": 3}'                      # => 409
+curl -sS http://localhost:8000/manuscripts/$MID/publications/current | jq '.edition'
+# => 4（新发布的定版没有被过期切换覆盖）
+
+# 以新的预期 4 重新提交，才能把读者生效版切回第 1 版
+curl -sS -X POST http://localhost:8000/manuscripts/$MID/publications/current \
+  -H 'Content-Type: application/json' \
+  -d '{"target_edition": 1, "expected_active_edition": 4}' | jq '.edition'      # => 1
+```
+
+> 提示：发布失败（修订冲突 `409` / 译文未确认 `422`）时既不会产生新版号，
+> 也不会移动生效版——读者继续看到上一份完整快照。改写、编排或复核工作稿
+> 同样不影响生效版；只有**发布成功**或一次**校验通过的切换**会改变它。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/manuscripts` | 创建稿件并录入有序原文段 |
-| GET | `/manuscripts/{id}` | 稿件元数据（含当前修订号） |
+| GET | `/manuscripts/{id}` | 稿件元数据（含当前修订号 `revision` 与生效版号 `active_edition`） |
 | GET | `/manuscripts/{id}/draft` | 工作稿：各段原文版本、译文、状态 |
 | PUT | `/manuscripts/{id}/segments/{p}/source` | 改写原文（带 `expected_revision`） |
 | POST | `/manuscripts/{id}/reorder` | 一次提交原子重排整篇：重排/删除旧段、插入新段（带 `expected_revision`） |
 | PUT | `/manuscripts/{id}/segments/{p}/translation` | 提交/改写译文（带 `source_version`） |
 | POST | `/manuscripts/{id}/segments/{p}/confirmation` | 确认译文（带 `source_version`） |
-| POST | `/manuscripts/{id}/publications` | 原子发布定版（带 `expected_revision`） |
+| POST | `/manuscripts/{id}/publications` | 原子发布定版（带 `expected_revision`）；同一事务推进生效版 |
 | GET | `/manuscripts/{id}/publications` | 定版列表 |
+| GET | `/manuscripts/{id}/publications/current` | 读取读者当前生效定版（从未发布时 `404`） |
+| POST | `/manuscripts/{id}/publications/current` | CAS 切换生效版到任一已发布旧版（`target_edition` + `expected_active_edition`） |
 | GET | `/manuscripts/{id}/publications/{edition}` | 按版号回看定版快照 |
 | GET | `/health` | 健康检查 |
 
-主要状态码：`200/201` 成功；`404` 稿件/段/定版不存在；`409` 修订冲突或
-依据过期原文版本；`422` 请求体校验失败、编排清单无效，或发布时存在
-阻塞段。
+主要状态码：`200/201` 成功；`404` 稿件/段/定版/切换目标不存在，或尚无
+生效定版；`409` 修订冲突、依据过期原文版本，或切换的预期生效版号过期；
+`422` 请求体校验失败、编排清单无效，或发布时存在阻塞段。
 
 ## 测试
 
@@ -291,4 +406,7 @@ PYTHONPATH=. python -m pytest tests -q
 失败不增版号、定版快照不可变、改写与发布并发下快照不跨修订拼装
 （含多轮并发压测），以及段落编排的重排 / 删除 / 插入、保留段状态随段
 移动、新段阻塞发布、过期与清单无效的整次回滚、编排与发布交错下定版
-只定格调整前或调整后的完整一整篇。
+只定格调整前或调整后的完整一整篇；另覆盖读者生效版的尚无定版 404、
+发布与指针更新同事务、发布失败不回退生效版、CAS 切换的目标不存在 /
+预期过期拒绝、切换不动工作稿也不新增版号、改写复核不影响生效版，以及
+切换与发布交错下过期切换绝不覆盖新发布定版（含多轮并发压测）。
